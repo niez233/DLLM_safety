@@ -574,28 +574,36 @@ def generate_response(
             random_rate=args.random_rate,
             debug_print=args.debug_print,
         )
+    # ======= 统一后置自纠正（与 remasking 解耦；非 PAD 路径才做，避免二次纠正） =======
+    need_post_correction = (
+        attack_method_lower != "pad"            # PAD 已在 generate_dream_hidden 内部处理
+        and args.sp_mode == "hidden"
+        and bool(template_attack)               # hidden 触发
+        and args.refinement_steps > 0
+        and args.remask_ratio > 0.0
+    )
 
-        # —— 外层 Self-Correction（仅在非 PAD 路径、sp_mode=hidden 且检测触发时执行）—— #
-        do_self_correction = (args.sp_mode == "hidden") and bool(template_attack)
-        if do_self_correction:
-            if args.debug_print:
-                logging.info(f"[Dream-AR] Self-Correction triggered: remask_ratio={args.remask_ratio}, "
-                             f"refinement_steps={args.refinement_steps}, scope={args.correction_scope}")
-            output_ids = apply_self_correction(
-                model=model,
-                tokenizer=tokenizer,
-                seq_ids=output_ids,
-                initial_mask_in_prompt=initial_mask_from_prompt,
-                steps=args.steps,
-                temperature=args.temperature,
-                mask_id=args.mask_id,
-                refinement_steps=args.refinement_steps,
-                remask_ratio=args.remask_ratio,
-                suppression_value=args.suppression_value,
-                correction_scope=args.correction_scope,
-                exclude_mask_positions=protected_index,
-                debug_print=args.debug_print,
+    if need_post_correction:
+        if args.debug_print:
+            logging.info(
+                f"[Post-SC] Self-Correction: remask_ratio={args.remask_ratio}, "
+                f"refinement_steps={args.refinement_steps}, scope={args.correction_scope}"
             )
+        output_ids = apply_self_correction(
+            model=model,
+            tokenizer=tokenizer,
+            seq_ids=output_ids,
+            initial_mask_in_prompt=initial_mask_from_prompt,
+            steps=args.steps,
+            temperature=args.temperature,
+            mask_id=args.mask_id,
+            refinement_steps=args.refinement_steps,
+            remask_ratio=args.remask_ratio,
+            suppression_value=args.suppression_value,
+            correction_scope=args.correction_scope,
+            exclude_mask_positions=protected_index,  # 仍然保护 system 前缀等
+            debug_print=args.debug_print,
+        )
 
     # 解码 & 特殊清理
     response = tokenizer.batch_decode(output_ids[:, matching_count:], skip_special_tokens=True)[0]

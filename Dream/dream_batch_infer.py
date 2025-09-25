@@ -315,7 +315,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--alg", type=str, default="entropy")
-    parser.add_argument("--alg_temp", type=float, default=0.0)
+    parser.add_argument("--alg_temp", type=float, default=0.5)
     parser.add_argument("--output_history", action="store_true",
                         help="需要逐步历史时开启（更耗显存）")
 
