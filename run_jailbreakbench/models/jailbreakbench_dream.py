@@ -708,11 +708,51 @@ def main():
             vanilla_prompt = build_chat_prompt(tokenizer, vanilla_user, is_instruct_model, system_for_both)
 
             # ========= Self-Detection（仅当 sp_mode=hidden 时执行；否则跳过）=========
-            sp_hid_tail = None
+            # sp_hid_tail = None
+            # baseline_mu = None
+            # ref_mu = None           # ★ 初始化，避免异常时未定义
+            # template_attack = None
+            # if args.sp_mode == "hidden":
+            #     ref_tail_len = max(int(getattr(args, "ref_tail_len", DEFAULT_REF_TAIL_LEN)), 0)
+            #     if ref_tail_len > 0:
+            #         det_vanilla_prompt = build_detection_prompt(
+            #             tokenizer, vanilla_text, is_instruct_model, system_for_both, ref_tail_len
+            #         )
+            #         det_refined_prompt = build_detection_prompt(
+            #             tokenizer, chosen_text,  is_instruct_model, system_for_both, ref_tail_len
+            #         )
+            #         try:
+            #             van_mu = first_step_tail_mean_hidden(model, tokenizer, det_vanilla_prompt, args.mask_id, ref_tail_len)
+            #             ref_mu = first_step_tail_mean_hidden(model, tokenizer, det_refined_prompt, args.mask_id, ref_tail_len)
+            #             sp_hid_tail = cosine_distance_vec(van_mu, ref_mu)  # 1 - cos
+            #             baseline_mu = van_mu
+            #             template_attack = (sp_hid_tail >= args.sp_threshold)
+            #             if args.debug_print:
+            #                 logging.info(f"[Dream-Det] Safety score={sp_hid_tail:.3f}, unsafe={bool(template_attack)}")
+            #         except Exception as e:
+            #             logging.info(f"[TailDetection] skip: {e}")
+            #             template_attack = False
+            #     else:
+            #         template_attack = False
+            # else:
+            #     template_attack = False  # 关闭检测 => 不触发SC
+
+            # # 初始掩码位（供 SC 使用；与解码路径无关）
+            # prompt_ids, _ = tokenized(model.device, tokenizer, prompt)
+            # initial_mask_from_prompt = (prompt_ids == args.mask_id)  # [1, L_prompt]
+                        # 初始掩码位（供 SC 使用；与解码路径无关）
+            prompt_ids, prompt_attn = tokenized(model.device, tokenizer, prompt)
+            initial_mask_from_prompt = (prompt_ids == args.mask_id)  # [1, L_prompt]
+
+            # ========= Self-Detection（仅当 sp_mode=hidden 时执行；否则跳过）=========
+            # 统一用 block-level 的 sp_hidden（1 - cos）做判定
+            sp_block = None          # block-level sp_hidden
             baseline_mu = None
-            ref_mu = None           # ★ 初始化，避免异常时未定义
-            template_attack = None
+            ref_mu = None
+            template_attack = False  # 默认不触发自纠正
+
             if args.sp_mode == "hidden":
+                # 1) 先用 tail hidden 做 baseline / probe（只是给 generate_dream_hidden 提供 h_origin / h_probe）
                 ref_tail_len = max(int(getattr(args, "ref_tail_len", DEFAULT_REF_TAIL_LEN)), 0)
                 if ref_tail_len > 0:
                     det_vanilla_prompt = build_detection_prompt(
@@ -722,24 +762,61 @@ def main():
                         tokenizer, chosen_text,  is_instruct_model, system_for_both, ref_tail_len
                     )
                     try:
-                        van_mu = first_step_tail_mean_hidden(model, tokenizer, det_vanilla_prompt, args.mask_id, ref_tail_len)
-                        ref_mu = first_step_tail_mean_hidden(model, tokenizer, det_refined_prompt, args.mask_id, ref_tail_len)
-                        sp_hid_tail = cosine_distance_vec(van_mu, ref_mu)  # 1 - cos
-                        baseline_mu = van_mu
-                        template_attack = (sp_hid_tail >= args.sp_threshold)
-                        if args.debug_print:
-                            logging.info(f"[Dream-Det] Safety score={sp_hid_tail:.3f}, unsafe={bool(template_attack)}")
+                        baseline_mu = first_step_tail_mean_hidden(
+                            model, tokenizer, det_vanilla_prompt, args.mask_id, ref_tail_len
+                        )
+                        ref_mu = first_step_tail_mean_hidden(
+                            model, tokenizer, det_refined_prompt, args.mask_id, ref_tail_len
+                        )
                     except Exception as e:
-                        logging.info(f"[TailDetection] skip: {e}")
-                        template_attack = False
-                else:
-                    template_attack = False
-            else:
-                template_attack = False  # 关闭检测 => 不触发SC
+                        logging.info(f"[TailBaseline] skip: {e}")
+                        baseline_mu, ref_mu = None, None
 
-            # 初始掩码位（供 SC 使用；与解码路径无关）
-            prompt_ids, _ = tokenized(model.device, tokenizer, prompt)
-            initial_mask_from_prompt = (prompt_ids == args.mask_id)  # [1, L_prompt]
+                # 2) 对非 PAD 攻击：用 generate_dream_hidden 做一次“探测前向”，得到 block-level sp_hidden
+                #    PAD 的自检 / 自纠正已经在 generate_dream_hidden 内部做了，这里不重复
+                if args.attack_method.lower() != "pad":
+                    try:
+                        _, sp_list = generate_dream_hidden(
+                            model=model,
+                            tokenizer=tokenizer,
+                            input_ids=prompt_ids,
+                            attention_mask=prompt_attn,
+                            gen_length=args.gen_length,
+                            steps=args.steps,
+                            block_length=args.gen_length,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                            alpha0=args.alpha0,
+                            sp_threshold=args.sp_threshold,
+                            baseline_hidden=baseline_mu,
+                            attack_probe_hidden=ref_mu,
+                            tau_hidden=0.80,              # 占位参数，和 generate_function_dream 接口对齐
+                            refinement_steps=0,            # ★ 探测模式：不做自纠正
+                            remask_ratio=0.0,
+                            suppression_value=args.suppression_value,
+                            correct_only_first_block=False,
+                            fill_all_masks=False,
+                            mask_id=int(args.mask_id),
+                            attack_method=args.attack_method.lower(),
+                            pad_anchors=args.pad_anchors,
+                            pad_positions=args.pad_positions,
+                            protect_anchors=bool(args.protect_anchors),
+                            correction_scope=args.correction_scope,
+                            initial_mask_in_prompt=initial_mask_from_prompt,
+                            exclude_mask_positions=None,
+                        )
+                        if sp_list and len(sp_list) > 0:
+                            sp_block = float(sp_list[0])
+                            template_attack = (sp_block >= args.sp_threshold)
+                            if args.debug_print:
+                                logging.info(
+                                    f"[Dream-Det] SP(hidden, block-level)={sp_block:.3f}, "
+                                    f"thr={args.sp_threshold:.3f}, unsafe={bool(template_attack)}"
+                                )
+                    except Exception as e:
+                        logging.info(f"[BlockDetection] skip: {e}")
+                        template_attack = False
+
 
             # 解码 + 可选自纠正
             if os.getenv("DEBUG_SHOW_PROMPT", "0") == "1":
@@ -771,7 +848,7 @@ def main():
                 "alpha0": args.alpha0,
                 "random_rate": args.random_rate,
                 "sp_mode": args.sp_mode,
-                "sp_hid_tail": sp_hid_tail,
+                "sp_hid_tail": sp_block,
                 "template_attack": bool(template_attack) if args.sp_mode == "hidden" else None,
                 "ref_tail_len": args.ref_tail_len if args.sp_mode == "hidden" else None,
                 "correction_scope": args.correction_scope if args.sp_mode == "hidden" else None,
@@ -794,3 +871,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
